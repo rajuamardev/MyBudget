@@ -3,14 +3,20 @@
   'use strict';
 
   const L = window.MyBudgetLogic;
-  if (!L || typeof L.typeLabel !== 'function' || typeof L.formatDay !== 'function') {
+  if (!L || typeof L.typeLabel !== 'function' || typeof L.formatDay !== 'function' || typeof L.diffState !== 'function' || typeof L.totalSummary !== 'function') {
     document.getElementById('view').innerHTML = '<div class="banner"><span>logic.js tidak ditemukan atau versinya lama. Pastikan index.html, styles.css, logic.js, dan app.js semuanya versi terbaru dan berada di satu folder, lalu muat ulang halaman.</span></div>';
     return;
   }
-  const KEY = 'mybudget:v1';
+  const LEGACY_KEY = 'mybudget:v1';     // old browser-only storage, read once to offer a migration
+  const CONFIG_KEY = 'mybudget:config'; // device-local connection settings (Apps Script URL + access code), never data
 
   let notice = '';
-  let state = load();
+  let state = L.emptyState();   // working copy shown in the UI
+  let synced = L.emptyState();  // last copy the spreadsheet confirmed; used to compute changes and to roll back
+  let conn = 'loading';         // setup | loading | error | ready
+  let connError = '';
+  let busy = false;             // a write is in flight
+  let lastLoad = 0;
   let formDelete = null;   // delete handler of the form currently open in the dialog
   let flashId = null;      // id of a just-created transaction, highlighted once on the next render
   const ui = { view: 'overview', month: L.currentMonthKey(), txType: 'all', txCategory: 'all' };
@@ -23,38 +29,140 @@
   const CAL = '<svg class="ic" width="24" height="24" viewBox="0 0 12 12" fill="currentColor" shape-rendering="crispEdges" aria-hidden="true"><path d="M2 1h2v1h-2zM8 1h2v1h-2zM0 2h12v1h-12zM0 3h12v1h-12zM0 4h1v1h-1zM11 4h1v1h-1zM0 5h1v1h-1zM2 5h2v1h-2zM5 5h2v1h-2zM8 5h2v1h-2zM11 5h1v1h-1zM0 6h1v1h-1zM2 6h2v1h-2zM5 6h2v1h-2zM8 6h2v1h-2zM11 6h1v1h-1zM0 7h1v1h-1zM11 7h1v1h-1zM0 8h1v1h-1zM2 8h2v1h-2zM5 8h2v1h-2zM8 8h2v1h-2zM11 8h1v1h-1zM0 9h1v1h-1zM2 9h2v1h-2zM5 9h2v1h-2zM8 9h2v1h-2zM11 9h1v1h-1zM0 10h1v1h-1zM11 10h1v1h-1zM0 11h12v1h-12z"/></svg>';
   const CHECK ='<svg class="ic check" width="16" height="16" viewBox="0 0 8 8" fill="currentColor" shape-rendering="crispEdges" aria-hidden="true"><path d="M6 1h2v1h-2zM5 2h2v1h-2zM0 3h1v1h-1zM4 3h2v1h-2zM0 4h2v1h-2zM3 4h2v1h-2zM1 5h3v1h-3zM2 6h1v1h-1z"/></svg>';
 
-  /* ---------- storage ---------- */
+  /* ---------- spreadsheet (Google Apps Script) ---------- */
 
-  function load() {
-    let raw = null;
-    try { raw = localStorage.getItem(KEY); } catch (e) {
-      notice = 'Penyimpanan browser tidak tersedia, jadi data tidak akan tersimpan.';
-      return L.emptyState();
-    }
-    if (!raw) return L.emptyState();
+  const URL_RE = /^(https:\/\/script\.google\.com\/(a\/macros\/[\w.-]+\/|macros\/)s\/[\w-]+\/exec|http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/\S*)$/;
+
+  function clone(x) { return JSON.parse(JSON.stringify(x)); }
+
+  function getConfig() {
     try {
-      const parsed = JSON.parse(raw);
-      if (L.isValidState(parsed)) return parsed;
-    } catch (e) { /* fall through */ }
-    try { localStorage.setItem(KEY + ':corrupt-backup', raw); } catch (e) { /* ignore */ }
-    notice = 'Data tersimpan tidak bisa dibaca. Salinannya disimpan di browser ini dengan nama "' + KEY + ':corrupt-backup".';
-    return L.emptyState();
+      const c = JSON.parse(localStorage.getItem(CONFIG_KEY) || 'null');
+      return c && typeof c.url === 'string' && typeof c.token === 'string' && c.url && c.token ? c : null;
+    } catch (e) { return null; }
+  }
+  function setConfig(c) { try { localStorage.setItem(CONFIG_KEY, JSON.stringify(c)); return true; } catch (e) { return false; } }
+
+  // One POST per call. text/plain keeps it a "simple" request, so the browser sends no CORS preflight (Apps Script cannot answer one).
+  function api(action, payload, cfg) {
+    cfg = cfg || getConfig();
+    if (!cfg) return Promise.reject({ kind: 'config' });
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 30000);
+    return fetch(cfg.url, {
+      method: 'POST', redirect: 'follow', cache: 'no-store',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(Object.assign({ token: cfg.token, action: action }, payload || {})),
+      signal: ctrl ? ctrl.signal : undefined
+    }).then(function (res) { return res.text(); }).then(function (txt) {
+      let j;
+      try { j = JSON.parse(txt); } catch (e) { throw { kind: 'format' }; }
+      if (!j || j.ok !== true) throw { kind: 'server', code: j && j.error };
+      return j;
+    }).catch(function (e) {
+      clearTimeout(timer);
+      if (e && e.kind) throw e;
+      throw { kind: e && e.name === 'AbortError' ? 'timeout' : 'network' };
+    }).then(function (j) { clearTimeout(timer); return j; });
   }
 
-  function save() {
-    try {
-      localStorage.setItem(KEY, JSON.stringify(state));
+  function errorText(err) {
+    const k = err && err.kind, code = err && err.code;
+    if (k === 'network') return 'Tidak bisa terhubung ke Spreadsheet. Periksa koneksi internet, lalu coba lagi.';
+    if (k === 'timeout') return 'Spreadsheet terlalu lama merespons. Coba lagi sebentar lagi.';
+    if (k === 'format') return 'Jawaban dari Apps Script tidak dikenali. Pastikan alamatnya benar dan deployment diizinkan untuk “Siapa saja”.';
+    if (k === 'config') return 'Spreadsheet belum terhubung.';
+    if (code === 'unauthorized') return 'Kode akses salah atau belum diatur di Apps Script.';
+    if (code === 'busy') return 'Spreadsheet sedang dipakai proses lain. Coba lagi.';
+    if (code === 'bad_request') return 'Data ditolak oleh Spreadsheet. Muat ulang halaman lalu coba lagi.';
+    return 'Spreadsheet mengembalikan kesalahan' + (code ? ' (' + code + ')' : '') + '.';
+  }
+
+  // Sends what changed since the last confirmed copy. On failure the working copy is rolled back, so the screen never shows data the spreadsheet does not have.
+  function persist(okMessage) {
+    const ops = L.diffState(synced, state);
+    if (!ops.length) { if (okMessage) toast(okMessage); return Promise.resolve({ ok: true }); }
+    busy = true;
+    return api('write', { ops: ops }).then(function () {
+      synced = clone(state); busy = false;
+      if (okMessage) toast(okMessage);
+      return { ok: true };
+    }, function (err) {
+      state = clone(synced); busy = false;
+      return { ok: false, errors: { _: 'Perubahan tidak tersimpan. ' + errorText(err) } };
+    });
+  }
+
+  function loadRemote(quiet) {
+    if (!quiet) { conn = 'loading'; connError = ''; render(); }
+    return api('read').then(function (res) {
+      const d = res.data;
+      const next = { version: 1, categories: d.categories, methods: d.methods, transactions: d.transactions, budgets: d.budgets, targets: d.targets };
+      if (!L.isValidState(next)) throw { kind: 'format' };
+      const changed = JSON.stringify(next) !== JSON.stringify(synced);
+      synced = clone(next); state = clone(next); lastLoad = Date.now();
+      const first = conn !== 'ready';
+      conn = 'ready';
+      if (first || changed) render();
+      if (first) offerMigration();
       return true;
-    } catch (e) {
-      toast('Gagal menyimpan ke browser. Perubahan bisa hilang saat halaman dimuat ulang.', 'error');
+    }, function (err) {
+      if (quiet) { toast(errorText(err), 'error'); return false; }
+      conn = 'error'; connError = errorText(err); render();
       return false;
+    });
+  }
+
+  // Data written by older versions lived only in this browser. If the spreadsheet is still empty, offer to move it over once.
+  function legacyState() {
+    try {
+      if (localStorage.getItem(LEGACY_KEY + ':skipped')) return null;
+      const raw = localStorage.getItem(LEGACY_KEY);
+      if (!raw) return null;
+      const s = JSON.parse(raw);
+      if (!L.isValidState(s)) return null;
+      const n = s.categories.length + s.methods.length + s.transactions.length + s.budgets.length + s.targets.length;
+      return n ? s : null;
+    } catch (e) { return null; }
+  }
+
+  function offerMigration() {
+    const old = legacyState();
+    const empty = !synced.categories.length && !synced.methods.length && !synced.transactions.length && !synced.budgets.length && !synced.targets.length;
+    if (!old || !empty) return;
+    formDelete = null;
+    $dlg.innerHTML = '<form class="dlg-form"><h2>Pindahkan data lama?</h2><p class="dlg-text">Di browser ini ada ' + old.transactions.length + ' transaksi dari versi sebelumnya, sedangkan Spreadsheet masih kosong. Pindahkan semuanya ke Spreadsheet?</p>' +
+      '<p class="form-error" role="alert"></p><div class="dlg-actions"><button type="button" class="btn" data-action="skip-migration">Lewati</button><button type="submit" class="btn primary">Pindahkan</button></div></form>';
+    $dlg.querySelector('form').addEventListener('submit', function (e) {
+      e.preventDefault();
+      const form = e.target;
+      setFormBusy(form, true, 'Memindahkan…');
+      state = { version: 1, categories: old.categories, methods: old.methods, transactions: old.transactions, budgets: old.budgets, targets: old.targets };
+      persist().then(function (r) {
+        setFormBusy(form, false);
+        if (!r.ok) { showErrors(form, r.errors); return; }
+        try { localStorage.setItem(LEGACY_KEY + ':migrated', localStorage.getItem(LEGACY_KEY)); localStorage.removeItem(LEGACY_KEY); } catch (er) { /* ignore */ }
+        closeDialog(); render(); toast('Data dipindahkan ke Spreadsheet');
+      });
+    });
+    showDialog();
+  }
+
+  function setFormBusy(form, on, label) {
+    form.querySelectorAll('button').forEach(function (b) { b.disabled = on; });
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) {
+      if (on) { submit.dataset.label = submit.textContent; submit.textContent = label || 'Menyimpan…'; }
+      else if (submit.dataset.label) submit.textContent = submit.dataset.label;
     }
   }
 
-  // Keep several open tabs in sync so one tab never overwrites another's newer data.
-  window.addEventListener('storage', function (e) {
-    if (e.key === KEY || e.key === null) { state = load(); render(); }
+  // Keep this device current when it comes back to the foreground (another device may have written meanwhile).
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible' || conn !== 'ready' || busy || $dlg.open) return;
+    if (Date.now() - lastLoad > 60000) loadRemote(true);
   });
+  $dlg.addEventListener('cancel', function (e) { if (busy) e.preventDefault(); });
 
   /* ---------- helpers ---------- */
 
@@ -158,6 +266,15 @@
       const data = {};
       new FormData(form).forEach(function (v, k) { data[k] = v; });
       const res = onSubmit(data);
+      if (res && typeof res.then === 'function') {
+        setFormBusy(form, true);
+        res.then(function (r) {
+          setFormBusy(form, false);
+          if (r && r.ok === false) { showErrors(form, r.errors || {}); return; }
+          closeDialog(); render();
+        });
+        return;
+      }
       if (res && res.ok === false) { showErrors(form, res.errors || {}); return; }
       closeDialog();
       render();
@@ -177,11 +294,21 @@
 
   function confirmDialog(title, message, onConfirm) {
     formDelete = null;
-    $dlg.innerHTML = '<form class="dlg-form"><h2>' + esc(title) + '</h2><p class="dlg-text">' + esc(message) + '</p><div class="dlg-actions">' +
+    $dlg.innerHTML = '<form class="dlg-form"><h2>' + esc(title) + '</h2><p class="dlg-text">' + esc(message) + '</p><p class="form-error" role="alert"></p><div class="dlg-actions">' +
       '<button type="button" class="btn" data-action="close-dialog">Batal</button><button type="submit" class="btn danger">Hapus</button></div></form>';
     $dlg.querySelector('form').addEventListener('submit', function (e) {
       e.preventDefault();
-      onConfirm();
+      const form = e.target;
+      const res = onConfirm();
+      if (res && typeof res.then === 'function') {
+        setFormBusy(form, true);
+        res.then(function (r) {
+          setFormBusy(form, false);
+          if (r && r.ok === false) { showErrors(form, r.errors || {}); return; }
+          closeDialog(); render();
+        });
+        return;
+      }
       closeDialog();
       render();
     });
@@ -223,6 +350,17 @@
     showDialog();
     const on = $dlg.querySelector('.mo.on');
     if (on) on.focus();
+  }
+
+  // All-time balance, independent of the month selected on the page.
+  function openTotal() {
+    const t = L.totalSummary(state);
+    formDelete = null;
+    $dlg.innerHTML = '<div class="dlg-form"><h2>Saldo Total</h2><p class="dlg-sub">Semua bulan yang tercatat, bukan hanya ' + esc(L.monthLabel(ui.month)) + '.</p>' +
+      '<p class="label">Saldo keseluruhan</p><p class="hero-value total-value' + (t.balance < 0 ? ' neg' : '') + '">' + money(t.balance) + '</p>' +
+      '<dl class="split"><div><dt>Total pemasukan</dt><dd class="pos">' + money(t.income) + '</dd></div><div><dt>Total pengeluaran</dt><dd class="neg">' + money(t.expense) + '</dd></div></dl>' +
+      '<div class="dlg-actions"><button type="button" class="btn primary" data-action="close-dialog">Tutup</button></div></div>';
+    showDialog();
   }
 
   function title(text, addAction, addLabel) {
@@ -273,7 +411,7 @@
       : !state.categories.length ? 'kategori' : !state.methods.length ? 'metode pembayaran' : '';
 
     let h = period('add-tx', 'transaksi');
-    h += '<section class="hero"><p class="label">Saldo</p><p class="hero-value' + (s.balance < 0 ? ' neg' : '') + '">' + money(s.balance) + '</p>' +
+    h += '<section class="hero"><div class="hero-head"><p class="label">Saldo</p><button type="button" class="link" data-action="show-total">Saldo Total</button></div><p class="hero-value' + (s.balance < 0 ? ' neg' : '') + '">' + money(s.balance) + '</p>' +
       '<dl class="split"><div><dt>Pemasukan</dt><dd class="pos">' + money(s.income) + '</dd></div><div><dt>Pengeluaran</dt><dd class="neg">' + money(s.expense) + '</dd></div></dl></section>';
 
     if (missing) {
@@ -380,12 +518,53 @@
         const n = L.methodUsage(state, m.id);
         return '<li><button type="button" class="item row" data-action="edit-method" data-id="' + m.id + '"><span class="name">' + esc(m.name) + '</span><span class="meta">' + (n ? n + ' transaksi' : 'Belum dipakai') + '</span></button></li>';
       }).join('') + '</ul>' : '<p class="empty">Belum ada metode pembayaran.</p>') + '</section>' +
-      '<p class="foot-hint">Ketuk item untuk mengubah nama atau menghapusnya. Item yang sedang dipakai tidak bisa dihapus.</p>';
+      '<p class="foot-hint">Ketuk item untuk mengubah nama atau menghapusnya. Item yang sedang dipakai tidak bisa dihapus.</p>' +
+      '<section class="sec"><div class="sec-head"><h2>Spreadsheet</h2></div><p class="conn-text">Semua data tersimpan di Google Spreadsheet milikmu dan dibuka dari sana di perangkat mana pun.</p>' +
+      '<div class="conn-actions"><button type="button" class="btn" data-action="reload">Muat ulang data</button><button type="button" class="btn" data-action="edit-connection">Ubah koneksi</button></div></section>';
   }
 
   /* ---------- render ---------- */
 
+  function gateView() {
+    if (conn === 'loading') return '<div class="period"><h1>MyBudget</h1></div><p class="empty" role="status">Memuat data dari Google Spreadsheet…</p>';
+    if (conn === 'error') {
+      return '<div class="period"><h1>MyBudget</h1></div><div class="banner"><span>' + esc(connError) + '</span></div>' +
+        '<div class="conn-actions"><button type="button" class="btn primary" data-action="retry-load">Coba lagi</button>' +
+        '<button type="button" class="btn" data-action="edit-connection">Ubah koneksi</button></div>';
+    }
+    const cfg = getConfig();
+    return '<div class="period"><h1>Hubungkan Spreadsheet</h1></div>' +
+      '<p class="conn-text">Data MyBudget disimpan di Google Spreadsheet milikmu. Tempel alamat Web app dari Apps Script dan kode akses yang kamu buat saat memasang <code>Code.gs</code>.</p>' +
+      '<form id="connect" class="conn-form" novalidate><p class="form-error" role="alert"></p>' +
+      field('Alamat Web app', 'url', textInput('url', cfg ? cfg.url : '', 'inputmode="url" placeholder="https://script.google.com/macros/s/…/exec" spellcheck="false" autocapitalize="off"')) +
+      field('Kode akses', 'token', '<input type="password" id="f-token" name="token" value="' + esc(cfg ? cfg.token : '') + '" autocomplete="off" spellcheck="false">') +
+      '<div class="conn-actions"><button type="submit" class="btn primary">Hubungkan</button>' +
+      (cfg ? '<button type="button" class="btn" data-action="cancel-connection">Batal</button>' : '') + '</div></form>';
+  }
+
+  function connectSubmit(form) {
+    const url = form.elements.url.value.trim(), token = form.elements.token.value.trim();
+    const errors = {};
+    if (!url) errors.url = 'Masukkan alamat Web app.';
+    else if (!URL_RE.test(url)) errors.url = 'Alamat harus berbentuk https://script.google.com/macros/s/…/exec';
+    if (!token) errors.token = 'Masukkan kode akses.';
+    if (Object.keys(errors).length) { showErrors(form, errors); return; }
+    setFormBusy(form, true, 'Menghubungkan…');
+    api('ping', {}, { url: url, token: token }).then(function () {
+      if (!setConfig({ url: url, token: token })) { setFormBusy(form, false); showErrors(form, { _: 'Browser tidak mengizinkan menyimpan pengaturan koneksi.' }); return; }
+      return loadRemote(false);
+    }, function (err) {
+      setFormBusy(form, false);
+      showErrors(form, { _: errorText(err) });
+    });
+  }
+
   function render() {
+    $nav.style.display = conn === 'ready' ? '' : 'none';
+    if (conn !== 'ready') {
+      $view.innerHTML = gateView();
+      return;
+    }
     $nav.querySelectorAll('button').forEach(function (b) {
       const active = b.dataset.view === ui.view;
       b.classList.toggle('active', active);
@@ -440,12 +619,15 @@
     const form = openForm(tx ? 'Ubah transaksi' : 'Transaksi baru', body, 'Simpan', function (d) {
       const res = L.saveTransaction(state, { id: tx && tx.id, type: d.type, amount: d.amount, description: d.description, categoryId: d.categoryId, date: d.date, methodId: d.methodId });
       if (!res.ok) return res;
-      const m = L.monthKey(res.item.date);
-      const moved = m !== ui.month;
-      ui.month = m;
-      if (!tx) flashId = res.item.id;
-      save();
-      toast('Transaksi disimpan' + (moved ? ' di ' + L.monthLabel(m) : ''));
+      const m = L.monthKey(res.item.date), newId = tx ? null : res.item.id;
+      return persist().then(function (r) {
+        if (!r.ok) return r;
+        const moved = m !== ui.month;
+        ui.month = m;
+        if (newId) flashId = newId;
+        toast('Transaksi disimpan' + (moved ? ' di ' + L.monthLabel(m) : ''));
+        return r;
+      });
     }, tx ? function () { removeTransaction(tx.id); } : null);
 
     const catSel = form.querySelector('#f-categoryId');
@@ -472,8 +654,7 @@
     openForm(cat ? 'Ubah kategori' : 'Kategori baru', body, 'Simpan', function (d) {
       const res = L.saveCategory(state, { id: cat && cat.id, name: d.name, type: d.type });
       if (!res.ok) return res;
-      save();
-      toast('Kategori disimpan');
+      return persist('Kategori disimpan');
     }, cat ? function () { removeCategory(cat.id); } : null);
   }
 
@@ -483,8 +664,7 @@
       'Simpan', function (d) {
         const res = L.saveMethod(state, { id: m && m.id, name: d.name });
         if (!res.ok) return res;
-        save();
-        toast('Metode pembayaran disimpan');
+        return persist('Metode pembayaran disimpan');
       }, m ? function () { removeMethod(m.id); } : null);
   }
 
@@ -507,8 +687,7 @@
     openForm(b ? 'Ubah anggaran' : 'Anggaran baru', body, 'Simpan', function (d) {
       const res = L.saveBudget(state, { id: b && b.id, month: b ? b.month : ui.month, categoryId: d.categoryId, amount: d.amount });
       if (!res.ok) return res;
-      save();
-      toast('Anggaran disimpan');
+      return persist('Anggaran disimpan');
     }, b ? function () { removeBudget(b.id); } : null);
   }
 
@@ -532,8 +711,7 @@
     openForm(t ? 'Ubah target' : 'Target baru', body, 'Simpan', function (d) {
       const res = L.saveTarget(state, { id: t && t.id, name: d.name, categoryId: d.categoryId, target: d.target, saved: d.saved });
       if (!res.ok) return res;
-      save();
-      toast('Target disimpan');
+      return persist('Target disimpan');
     }, t ? function () { removeTarget(t.id); } : null);
   }
 
@@ -545,7 +723,7 @@
     const blocked = L.deleteCategory(JSON.parse(JSON.stringify(state)), id); // dry run on a copy
     if (!blocked.ok) { openMessage('Kategori tidak bisa dihapus', blocked.errors._); return; }
     confirmDialog('Hapus kategori?', '“' + cat.name + '” tidak dipakai di mana pun. Tindakan ini tidak bisa dibatalkan.', function () {
-      L.deleteCategory(state, id); save(); toast('Kategori dihapus');
+      L.deleteCategory(state, id); return persist('Kategori dihapus');
     });
   }
 
@@ -555,7 +733,7 @@
     const blocked = L.deleteMethod(JSON.parse(JSON.stringify(state)), id);
     if (!blocked.ok) { openMessage('Metode pembayaran tidak bisa dihapus', blocked.errors._); return; }
     confirmDialog('Hapus metode pembayaran?', '“' + m.name + '” tidak dipakai di transaksi mana pun. Tindakan ini tidak bisa dibatalkan.', function () {
-      L.deleteMethod(state, id); save(); toast('Metode pembayaran dihapus');
+      L.deleteMethod(state, id); return persist('Metode pembayaran dihapus');
     });
   }
 
@@ -563,7 +741,7 @@
     const t = L.byId(state.transactions, id);
     if (!t) return;
     confirmDialog('Hapus transaksi?', '“' + t.description + '”, ' + money(t.amount) + ' pada ' + L.formatDate(t.date) + '. Total dan anggaran akan ikut diperbarui. Tindakan ini tidak bisa dibatalkan.', function () {
-      L.deleteTransaction(state, id); save(); toast('Transaksi dihapus');
+      L.deleteTransaction(state, id); return persist('Transaksi dihapus');
     });
   }
 
@@ -571,7 +749,7 @@
     const b = L.byId(state.budgets, id);
     if (!b) return;
     confirmDialog('Hapus anggaran?', 'Anggaran ' + L.monthLabel(b.month) + ' untuk “' + catName(b.categoryId) + '” akan dihapus. Transaksi tidak terpengaruh.', function () {
-      L.deleteBudget(state, id); save(); toast('Anggaran dihapus');
+      L.deleteBudget(state, id); return persist('Anggaran dihapus');
     });
   }
 
@@ -579,7 +757,7 @@
     const t = L.byId(state.targets, id);
     if (!t) return;
     confirmDialog('Hapus target?', '“' + t.name + '” beserta dana terkumpulnya akan dihapus. Tindakan ini tidak bisa dibatalkan.', function () {
-      L.deleteTarget(state, id); save(); toast('Target dihapus');
+      L.deleteTarget(state, id); return persist('Target dihapus');
     });
   }
 
@@ -589,7 +767,14 @@
     const el = e.target.closest('[data-action]');
     if (!el) return;
     const id = el.dataset.id;
+    if (busy && el.dataset.action !== 'close-dialog') return;
     switch (el.dataset.action) {
+      case 'show-total': openTotal(); break;
+      case 'retry-load': loadRemote(false); break;
+      case 'reload': toast('Memuat ulang…'); loadRemote(true).then(function (ok) { if (ok) { render(); toast('Data dimuat ulang'); } }); break;
+      case 'edit-connection': conn = 'setup'; render(); break;
+      case 'cancel-connection': if (lastLoad) { conn = 'ready'; render(); } else loadRemote(false); break;
+      case 'skip-migration': try { localStorage.setItem(LEGACY_KEY + ':skipped', '1'); } catch (er) { /* ignore */ } closeDialog(); break;
       case 'go': closeDialog(); ui.view = el.dataset.view; render(); window.scrollTo(0, 0); break;
       case 'open-month': openMonthPicker(); break;
       case 'pick-month': ui.month = el.dataset.month; closeDialog(); render(); break;
@@ -607,7 +792,10 @@
       case 'edit-budget': openBudgetForm(L.byId(state.budgets, id)); break;
       case 'copy-budgets': {
         const n = L.copyBudgets(state, L.shiftMonth(ui.month, -1), ui.month);
-        save(); render(); toast(n + ' anggaran disalin');
+        persist().then(function (r) {
+          render();
+          if (r.ok) toast(n + ' anggaran disalin'); else toast(r.errors._, 'error');
+        });
         break;
       }
       case 'add-target': openTargetForm(null); break;
@@ -634,5 +822,9 @@
     clearFieldError(e);
   });
 
-  render();
+  document.addEventListener('submit', function (e) {
+    if (e.target && e.target.id === 'connect') { e.preventDefault(); connectSubmit(e.target); }
+  });
+
+  if (getConfig()) loadRemote(false); else { conn = 'setup'; render(); }
 })();
