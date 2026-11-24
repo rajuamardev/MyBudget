@@ -71,6 +71,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .hero { margin-bottom: 28px; padding: 16px 18px 18px; background: var(--panel); border: 3px solid var(--ink); box-shadow: 4px 4px 0 var(--ink); }
 .label { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
 .hero-value { margin-top: 2px; font-size: 44px; font-weight: 600; line-height: 1.1; overflow-wrap: anywhere; }
+.hero-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.hero-head .link { font-size: 14px; }
+.total-value { margin-bottom: 4px; }
 .neg { color: var(--neg); }
 .pos { color: var(--pos); }
 .warn { color: var(--warn); font-weight: 500; }
@@ -180,6 +183,12 @@ dialog::backdrop { background: rgba(30, 43, 26, 0.55); }
 .field-error:empty { display: none; }
 .form-error { margin-bottom: 16px; padding: 8px 12px; border: 2px solid var(--neg); color: var(--neg); font-size: 14px; }
 .form-error:empty { display: none; }
+.conn-text { margin-bottom: 16px; color: var(--muted); }
+.conn-text code { padding: 0 4px; background: var(--tint); }
+.conn-form { max-width: 480px; }
+.conn-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+.conn-form .conn-actions { margin-top: 20px; }
+.btn:disabled { opacity: 0.6; cursor: wait; }
 .static-text { height: 40px; line-height: 40px; font-weight: 500; }
 
 .seg { display: flex; border: 2px solid var(--ink); }
