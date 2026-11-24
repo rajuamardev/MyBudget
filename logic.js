@@ -109,6 +109,32 @@
     return { income: income, expense: expense, balance: income - expense };
   }
 
+  // Totals across every month, ignoring whichever month is selected.
+  function totalSummary(state) {
+    let income = 0, expense = 0;
+    state.transactions.forEach(function (t) {
+      if (t.type === 'income') income += t.amount;
+      else if (t.type === 'expense') expense += t.amount;
+    });
+    return { income: income, expense: expense, balance: income - expense };
+  }
+
+  // What changed between two states, as write operations for the spreadsheet backend (matched by id).
+  const COLLECTIONS = ['categories', 'methods', 'transactions', 'budgets', 'targets'];
+  function diffState(before, after) {
+    const ops = [];
+    COLLECTIONS.forEach(function (c) {
+      const old = {}, seen = {};
+      before[c].forEach(function (x) { old[x.id] = JSON.stringify(x); });
+      after[c].forEach(function (x) {
+        seen[x.id] = true;
+        if (old[x.id] !== JSON.stringify(x)) ops.push({ c: c, op: 'put', row: x });
+      });
+      before[c].forEach(function (x) { if (!seen[x.id]) ops.push({ c: c, op: 'del', id: x.id }); });
+    });
+    return ops;
+  }
+
   function spentFor(state, month, categoryId) {
     let sum = 0;
     state.transactions.forEach(function (t) {
@@ -365,12 +391,12 @@
   }
 
   return {
-    version: 4,
+    version: 5,
     emptyState: emptyState, isValidState: isValidState, uid: uid, byId: byId, typeLabel: typeLabel,
     todayISO: todayISO, monthKey: monthKey, currentMonthKey: currentMonthKey, isValidMonth: isValidMonth,
     isValidDate: isValidDate, shiftMonth: shiftMonth, monthLabel: monthLabel, formatDate: formatDate, formatDay: formatDay,
     parseAmount: parseAmount, formatIDR: formatIDR, formatPct: formatPct,
-    filterTransactions: filterTransactions, summarize: summarize, spentFor: spentFor,
+    filterTransactions: filterTransactions, summarize: summarize, totalSummary: totalSummary, diffState: diffState, spentFor: spentFor,
     budgetsForMonth: budgetsForMonth, budgetProgress: budgetProgress, targetProgress: targetProgress,
     categoryUsage: categoryUsage, describeCategoryUsage: describeCategoryUsage, methodUsage: methodUsage,
     saveCategory: saveCategory, deleteCategory: deleteCategory,
